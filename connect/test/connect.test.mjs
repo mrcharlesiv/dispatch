@@ -4,7 +4,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { setup, off, status, nousAccount, hermesHome, desktopTheme, desktopThemePath, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText, relayable } from '../hermes-hq-connect.mjs'
+import { setup, off, status, funnelOn, nousAccount, hermesHome, desktopTheme, desktopThemePath, hermesBackends, choosePort, publicUrl, connectLink, NextStep, nextStepText, relayable } from '../hermes-hq-connect.mjs'
 
 const HOME = '/Users/new'
 const jwt = (claims) => ['e30', Buffer.from(JSON.stringify(claims)).toString('base64url'), 'x'.repeat(120)].join('.')
@@ -56,6 +56,14 @@ function machine({ hermes = true, running = true, nous = true, tailscale = 'runn
       }
       if (cmd === '/bin/launchctl' && args[0] === 'bootout') { loaded.delete(label(args[1])); if (label(args[1]) === 'com.hermes-hq.hermes') running = false; return { status: 0 } }
       if (cmd.endsWith('tailscale') && args[0] === 'status') return { status: 0, stdout: JSON.stringify({ BackendState: tailscale === 'running' ? 'Running' : 'NeedsLogin', CertDomains: https ? ['new-mac.tail1.ts.net'] : [], Self: { DNSName: 'new-mac.tail1.ts.net.', Capabilities: funnelAllowed ? ['https://tailscale.com/cap/funnel-ports?ports=443,8443,10000'] : [] } }) }
+      if (cmd.endsWith('tailscale') && args[0] === 'serve' && args[1] === '--bg') {
+        // Serve: the same handler, only on the tailnet (no AllowFunnel).
+        const port = args[2].split('=')[1], key = `new-mac.tail1.ts.net:${port}`
+        const { [key]: _, ...allow } = funnel.AllowFunnel ?? {}
+        funnel = { TCP: { ...(funnel.TCP ?? {}), [port]: { HTTPS: true } }, Web: { ...(funnel.Web ?? {}), [key]: { Handlers: { '/': { Proxy: args[3] } } } }, ...(Object.keys(allow).length ? { AllowFunnel: allow } : {}) }
+        return { status: 0 }
+      }
+      if (cmd.endsWith('tailscale') && args[0] === 'serve' && args[2] === 'off') { funnel = {}; return { status: 0 } }
       if (cmd.endsWith('tailscale') && args[0] === 'serve') return { status: 0, stdout: JSON.stringify(funnel) }
       if (cmd.endsWith('tailscale') && args[0] === 'funnel' && args[1] === '--bg') {
         const port = args[2].split('=')[1]
@@ -168,6 +176,73 @@ test('off: closes the public address and stops the gatekeeper', async () => {
   await off(m.deps)
   assert.ok(m.ran.includes('/x/bin/tailscale funnel --https=443 off'))
   assert.equal(m.state().edgeLoaded, false)
+})
+
+test('--private: the same setup, but Tailscale Serve (only on the tailnet), never Funnel; says the phone needs Tailscale', async () => {
+  const m = machine({ funnelAllowed: false })
+  const result = await setup(m.deps, { reach: 'private' })
+  assert.equal(result.url, 'https://new-mac.tail1.ts.net')
+  assert.equal(result.private, true)
+  assert.ok(m.ran.includes('/x/bin/tailscale serve --bg --https=443 http://127.0.0.1:9139'))
+  assert.ok(!m.ran.some((c) => /tailscale funnel/.test(c)), 'Funnel is never touched')
+  assert.ok(m.ran.some((c) => c.includes('dashboard register') && c.includes('https://new-mac.tail1.ts.net/auth/callback')), 'registered with Nous for the same address')
+  assert.equal(JSON.parse(m.files.get(`${HOME}/.config/hermes-hq-edge/config.json`)).reach, 'private')
+  assert.equal(funnelOn({ dnsName: 'new-mac.tail1.ts.net', serve: m.state().funnel }, 443), false)
+  const out = m.logs.join('\n')
+  assert.match(out, /private address is on/)
+  assert.match(out, /leave Tailscale connected on your iPhone/)
+  assert.doesNotMatch(out, /Your phone doesn't need Tailscale|not your phone/)
+})
+
+test('--private is kept: running it again without a flag changes nothing, and status says private', async () => {
+  const m = machine()
+  await setup(m.deps, { reach: 'private' })
+  const before = m.ran.length
+  const again = await setup(m.deps)
+  assert.equal(again.private, true)
+  assert.deepEqual(m.ran.slice(before).filter((c) => /register|kickstart|bootstrap|bootout|funnel|serve --/.test(c)), [])
+  const s = await status(m.deps)
+  assert.equal(s.private, true)
+  assert.equal(s.url, 'https://new-mac.tail1.ts.net')
+  assert.match(m.logs.join('\n'), /Private address \(only your Tailscale devices\): https:\/\/new-mac\.tail1\.ts\.net/)
+})
+
+test('switching: a public setup run with --private turns Funnel off first, then serves; --public switches back', async () => {
+  const m = machine()
+  await setup(m.deps)
+  assert.equal(funnelOn({ dnsName: 'new-mac.tail1.ts.net', serve: m.state().funnel }, 443), true)
+  let before = m.ran.length
+  await setup(m.deps, { reach: 'private' })
+  assert.deepEqual(m.ran.slice(before).filter((c) => /tailscale (funnel|serve) --/.test(c)),
+    ['/x/bin/tailscale funnel --https=443 off', '/x/bin/tailscale serve --bg --https=443 http://127.0.0.1:9139'])
+  assert.equal(funnelOn({ dnsName: 'new-mac.tail1.ts.net', serve: m.state().funnel }, 443), false)
+  assert.ok(!m.ran.slice(before).some((c) => /register|kickstart/.test(c)), 'same address: no new registration, no Hermes restart')
+  before = m.ran.length
+  await setup(m.deps, { reach: 'public' })
+  assert.deepEqual(m.ran.slice(before).filter((c) => /tailscale (funnel|serve) --/.test(c)),
+    ['/x/bin/tailscale serve --https=443 off', '/x/bin/tailscale funnel --bg --https=443 http://127.0.0.1:9139'])
+  assert.equal(JSON.parse(m.files.get(`${HOME}/.config/hermes-hq-edge/config.json`)).reach, undefined)
+})
+
+test('--private: a port Funnel does not allow is fine, and off closes the private address', async () => {
+  const m = machine({ serve: { TCP: { 443: {}, 8443: {} } } })
+  m.deps.run = ((run) => (cmd, args) => cmd.endsWith('tailscale') && args[0] === 'status'
+    ? { status: 0, stdout: JSON.stringify({ BackendState: 'Running', CertDomains: ['new-mac.tail1.ts.net'], Self: { DNSName: 'new-mac.tail1.ts.net.', Capabilities: ['https://tailscale.com/cap/funnel-ports?ports=443,8443'] } }) }
+    : run(cmd, args))(m.deps.run)
+  const result = await setup(m.deps, { reach: 'private' })
+  assert.equal(result.url, 'https://new-mac.tail1.ts.net:10000')
+  await off(m.deps)
+  assert.ok(m.ran.includes('/x/bin/tailscale serve --https=10000 off'))
+  assert.match(m.logs.join('\n'), /Private address https:\/\/new-mac\.tail1\.ts\.net:10000 is off/)
+})
+
+test('--private in agent mode: DONE tells the person their phone needs Tailscale on', async () => {
+  const m = machine()
+  m.deps.agent = true
+  await setup(m.deps, { reach: 'private' })
+  const out = m.logs.join('\n')
+  assert.match(out, /DONE/)
+  assert.match(out, /Tailscale must be connected on their phone, signed in to the same account/)
 })
 
 test('Hermes not running: starts `hermes serve` in the background, as a job Hermes\'s own updater restarts, then carries on', async () => {

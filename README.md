@@ -63,13 +63,33 @@ times faster on a cellular connection.
 keeps the Nous accounts you allowed, your public address and your sign-ins. The address drops for a second or two
 while the new gatekeeper takes over from the old one.
 
+## Already use Tailscale on your phone? Keep it off the internet
+
+If your iPhone already runs Tailscale (say, always on, or with an exit node into your home network) and you'd rather
+not put the computer on the internet at all, add `--private`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- --private
+```
+
+It's the same setup, with one difference: the address is shared with Tailscale Serve instead of Funnel, so only
+devices on your own Tailscale network can reach it, and nothing on the internet can. Sign this computer in to Tailscale
+with the same account as your phone. Sign in with Nous works the same way, because the sign-in happens in your phone's
+browser, which is on your Tailscale network. Leave Tailscale connected on the phone: away from it, Hermes HQ can't
+reach the computer. In Hermes HQ, turn on **This iPhone already uses Tailscale** on the first setup screen and the app
+gives you this command (or the message for Hermes, with `--private` in it).
+
+Running the command again keeps the address private; there's no need to repeat `--private`. To switch to the public
+address later, run it with `--public`. A computer set up with the public address switches to private the same way:
+run it again with `--private`, and the public address is closed.
+
 ## Turn it off
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- off
 ```
 
-That closes the public address, stops the gatekeeper, and stops Hermes running in the background if this setup
+That closes the address (public or private), stops the gatekeeper, and stops Hermes running in the background if this setup
 started it. Check what's on with `sh -s -- status`. For an agent (or a script), add `--agent`: each run ends in DONE
 with the address, or a NEXT STEP (exit code 3) saying what to do before running it again. To see what setup
 would change without changing anything, use `sh -s -- --dry-run`.
@@ -88,13 +108,14 @@ would change without changing anything, use `sh -s -- --dry-run`.
   that itself. Live streams, pictures and audio pass through as Hermes sends them.
 
 Requirements: a Mac, or Linux with systemd, with Hermes installed; a free Nous account; and a free Tailscale account
-for that computer. Your phone needs only Hermes HQ.
+for that computer. Your phone needs only Hermes HQ (and Tailscale too, with `--private`).
 
 ## Files
 
 - `connect.sh` downloads `connect/` into `~/.config/hermes-hq-edge/connect` and runs it with Node (the Node that
   Hermes includes works).
-- `connect/hermes-hq-connect.mjs` is the setup command: `setup` (the default), `status`, `off`, `--dry-run`.
+- `connect/hermes-hq-connect.mjs` is the setup command: `setup` (the default), `status`, `off`, `--dry-run`,
+  `--private`, `--public`.
 - `connect/hermes-hq-edge.mjs` is the gatekeeper. It runs as the `com.hermes-hq.edge` LaunchAgent on a Mac, or the
   `hermes-hq-edge.service` systemd user service on Linux, and listens only on this computer. (Mac setups from before
   the rename used `com.dispatch.edge` and `~/.config/dispatch-edge`; setup moves them over and leaves the old folder

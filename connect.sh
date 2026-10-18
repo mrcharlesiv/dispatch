@@ -3,7 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- off
-#   (also: status, --dry-run)
+#   curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- --private
+#     (the address only on your own Tailscale network, never on the internet; your phone needs Tailscale)
+#   (also: status, --dry-run, --public)
 #
 # Downloads connect/ into ~/.config/hermes-hq-edge/connect and runs it with Node (the Node Hermes ships is fine).
 # A setup from before the rename (~/.config/dispatch-edge, com.dispatch.edge) is moved over by hermes-hq-connect.

@@ -16,11 +16,16 @@
 //   6. hermes-hq-edge (the owner-only gatekeeper) is installed with this computer's Nous account as the owner.
 //      An install from before the rename (com.dispatch.edge, ~/.config/dispatch-edge, on a Mac) is moved over: its
 //      config is copied, the new job takes its place, and only then is the old job removed (its folder is left as it was).
-//   7. Tailscale Funnel points the public address at the gatekeeper, nothing else.
+//   7. Tailscale Funnel points the public address at the gatekeeper, nothing else. With --private, Tailscale Serve
+//      does instead: the address answers only on the person's own Tailscale network (their phone runs Tailscale too),
+//      never on the internet. The choice is kept in the gatekeeper's config, so running this again keeps it; --public
+//      switches back.
 //   8. A QR code for the phone: scanning it opens Hermes HQ with the address filled in.
 //
 //   node hermes-hq-connect.mjs            set up (or repair) everything; safe to run again
 //   node hermes-hq-connect.mjs --dry-run  say what would change, change nothing
+//   node hermes-hq-connect.mjs --private  the same, but the address is only on your Tailscale network, not public
+//   node hermes-hq-connect.mjs --public   switch a --private setup back to the public address
 //   node hermes-hq-connect.mjs status     what's set up
 //   node hermes-hq-connect.mjs off        turn the public address and the gatekeeper off
 //   ... --agent                           for Hermes itself to run (and any run without a terminal): it never waits on a
@@ -407,15 +412,21 @@ export function tailscaleState(deps, cli) {
   }
 }
 
-/** The public port: the one already pointing at the gatekeeper, else the first allowed port nothing else uses. */
-export function choosePort(ts, edgePort) {
+/** The address's port: the one already pointing at the gatekeeper, else the first allowed port nothing else uses.
+ *  Funnel allows only some ports; a tailnet-only address (Serve) may use any of them. */
+export function choosePort(ts, edgePort, { tailnetOnly = false } = {}) {
   const web = ts.serve?.Web ?? {}
   for (const [hostPort, conf] of Object.entries(web)) {
     if (Object.values(conf?.Handlers ?? {}).some((h) => h?.Proxy === `http://127.0.0.1:${edgePort}`)) return Number(hostPort.split(':').pop())
   }
   const used = new Set(Object.keys(ts.serve?.TCP ?? {}).map(Number))
-  return [443, 8443, 10000].find((p) => ts.funnelPorts.includes(p) && !used.has(p)) ?? null
+  return [443, 8443, 10000].find((p) => (tailnetOnly || ts.funnelPorts.includes(p)) && !used.has(p)) ?? null
 }
+
+/** Whether the address on `port` is public (Funnel), or only on the tailnet (Serve). */
+export const funnelOn = (ts, port) => (ts.serve?.AllowFunnel ?? {})[`${ts.dnsName}:${port}`] === true
+/** Whether `port` points at the gatekeeper at all (public or not). */
+const servesEdge = (ts, port, edgePort) => Object.values(ts.serve?.Web?.[`${ts.dnsName}:${port}`]?.Handlers ?? {}).some((h) => h?.Proxy === `http://127.0.0.1:${edgePort}`)
 
 export const publicUrl = (dnsName, port) => `https://${dnsName}${port === 443 ? '' : ':' + port}`
 export const connectLink = (url) => `hermes://connect?url=${encodeURIComponent(url)}`
@@ -481,7 +492,9 @@ export class NextStep extends Stop { constructor(forWhom, message) { super(messa
  *  message (it once sent a Nous sign-in file that way), so paths become "…". Links are left as they are. */
 /** Why Tailscale, in the same plain words wherever a step asks for it: Sign in with Nous is who gets in, Tailscale is
  *  how the phone finds the computer, and it runs only on the computer. */
-const tailscaleWhy = (it) => `Tailscale (free) gives ${it} an address your phone can reach from anywhere, and Sign in with Nous makes sure only you get in. Your phone doesn't need Tailscale.`
+const tailscaleWhy = (it, tailnetOnly = false) => tailnetOnly
+  ? `Tailscale (free) gives ${it} an address only your own Tailscale devices can reach, and Sign in with Nous makes sure only you get in. Use the same Tailscale account as on your phone.`
+  : `Tailscale (free) gives ${it} an address your phone can reach from anywhere, and Sign in with Nous makes sure only you get in. Your phone doesn't need Tailscale.`
 export const relayable = (text) => String(text ?? '').replace(/(^|[\s"'(=])(?:~\/|\/)[^\s"')]+/g, '$1…').replace(/\s+/g, ' ').trim()
 export const nextStepText = (step) => step.forWhom === 'person'
   ? `NEXT STEP for the person (send them this, word for word, then wait until they say it's done):\n  ${step.message}\nThen run this same command again.`
@@ -502,7 +515,9 @@ function nousSignInForAgent(deps, hermes) {
 }
 
 
-export async function setup(deps, { dryRun = false } = {}) {
+/** `reach`: 'private' (only on the tailnet), 'public' (Funnel), or undefined to keep what this computer was set up with
+ *  (public the first time). */
+export async function setup(deps, { dryRun = false, reach } = {}) {
   const say = (line) => deps.log(line)
   const done = (line) => say('  ✓ ' + line)
   const todo = (line) => say((dryRun ? '  • would ' : '  → ') + line)
@@ -516,8 +531,14 @@ export async function setup(deps, { dryRun = false } = {}) {
     throw new Stop('This setup keeps Hermes and its gatekeeper running with systemd user services, which this session can\'t reach. Log in to this computer directly or over SSH (not with su or sudo), then run this again.')
   }
   const agent = Boolean(deps.agent) && !dryRun
+  const existing = readEdgeConfig(deps)
+  const tailnetOnly = (reach ?? existing?.reach) === 'private'
+  const why = (it) => tailscaleWhy(it, tailnetOnly)
+  const notPhone = tailnetOnly ? '' : ' (not on your phone)'
   say(`Setting up ${computer} for Hermes HQ. It takes a few minutes; ${agent ? 'a step that needs the person says NEXT STEP' : 'you\'ll be told when to do something'}.`)
-  say(`It may need two free sign-ins: Nous, so only you get in, and Tailscale, which gives ${computer} an address your phone can reach from anywhere (only ${computer} needs Tailscale, not your phone).\n`)
+  say(tailnetOnly
+    ? `It may need two free sign-ins: Nous, so only you get in, and Tailscale, with the same account as your phone. The address stays off the internet: only your own Tailscale devices can reach it.\n`
+    : `It may need two free sign-ins: Nous, so only you get in, and Tailscale, which gives ${computer} an address your phone can reach from anywhere (only ${computer} needs Tailscale, not your phone).\n`)
 
   // 1. Hermes and its backend: started in the background if none is running.
   const hermes = findHermes(deps)
@@ -625,34 +646,34 @@ export async function setup(deps, { dryRun = false } = {}) {
     } else cli = await ownTailscale(deps, jobs, say, todo)
   }
   const own = cli === ownCli
-  if (!cli && agent && mac) throw new NextStep('person', `Install Tailscale on the Mac running Hermes (not on your phone): https://tailscale.com/download/mac or the Mac App Store. Open it and sign in. ${tailscaleWhy('that Mac')}`)
-  if (!cli) throw new Stop(mac ? `Install Tailscale on this Mac (not on your phone): https://tailscale.com/download/mac. Open it, sign in, then run this again. ${tailscaleWhy('this Mac')}`
-    : 'Install Tailscale on this computer (not on your phone): curl -fsSL https://tailscale.com/install.sh | sh, then sudo tailscale up and sign in. Then run this again.')
+  if (!cli && agent && mac) throw new NextStep('person', `Install Tailscale on the Mac running Hermes${notPhone}: https://tailscale.com/download/mac or the Mac App Store. Open it and sign in. ${why('that Mac')}`)
+  if (!cli) throw new Stop(mac ? `Install Tailscale on this Mac${notPhone}: https://tailscale.com/download/mac. Open it, sign in, then run this again. ${why('this Mac')}`
+    : `Install Tailscale on this computer${notPhone}: curl -fsSL https://tailscale.com/install.sh | sh, then sudo tailscale up and sign in. Then run this again.`)
   let ts = tailscaleState(deps, cli)
   if (!ts.running && own) {
     // This account's own Tailscale: signing it in takes only its link, opened in any browser.
     if (agent) {
       const link = tailscaleSignInLink(deps, cli)
       ts = tailscaleState(deps, cli)
-      if (!ts.running && link) throw new NextStep('person', `Sign in to Tailscale for the computer running Hermes: open ${link}. ${tailscaleWhy('that computer')}`)
+      if (!ts.running && link) throw new NextStep('person', `Sign in to Tailscale for the computer running Hermes: open ${link}. ${why('that computer')}`)
       if (!ts.running) throw new NextStep('agent', 'Tailscale on this computer is still starting. Wait a minute, then run this same command again.')
     } else {
-      say(`  → Sign in to Tailscale: open the link below in any browser, then come back here. ${tailscaleWhy('this computer')}`)
+      say(`  → Sign in to Tailscale: open the link below in any browser, then come back here. ${why('this computer')}`)
       deps.run(cli, ['up'], { interactive: true, timeoutMs: 15 * 60_000 })
       ts = tailscaleState(deps, cli)
       if (!ts.running) throw new Stop('Tailscale isn\'t signed in yet. Run this again and open the link it shows.')
     }
   }
   if (!ts.running && agent) {
-    if (mac) throw new NextStep('person', `Open the Tailscale app on the Mac running Hermes and sign in. ${tailscaleWhy('that Mac')}`)
+    if (mac) throw new NextStep('person', `Open the Tailscale app on the Mac running Hermes and sign in. ${why('that Mac')}`)
     const root = sudoPrefix(deps)
-    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: sudo tailscale up --operator=${deps.user}. ${tailscaleWhy('that computer')}`)
+    if (!root) throw new NextStep('person', `On the computer running Hermes, run this once in a terminal (it asks for your password), then open the sign-in link it shows: sudo tailscale up --operator=${deps.user}. ${why('that computer')}`)
     // `tailscale up` leaves the sign-in link with Tailscale itself: waiting for it is the person's job, not this run's.
     const r = asRoot(deps, root, cli, ['up', `--operator=${deps.user}`, '--timeout=15s'], { timeoutMs: 30_000 })
     let auth = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
     try { auth ??= JSON.parse(deps.run(cli, ['status', '--json']).stdout).AuthURL || undefined } catch {}
     ts = tailscaleState(deps, cli)
-    if (!ts.running) throw new NextStep('person', (auth ? `Sign in to Tailscale for the computer running Hermes: open ${auth}.` : `On the computer running Hermes, run this once in a terminal and open the sign-in link it shows: sudo tailscale up --operator=${deps.user}.`) + ' ' + tailscaleWhy('that computer'))
+    if (!ts.running) throw new NextStep('person', (auth ? `Sign in to Tailscale for the computer running Hermes: open ${auth}.` : `On the computer running Hermes, run this once in a terminal and open the sign-in link it shows: sudo tailscale up --operator=${deps.user}.`) + ' ' + why('that computer'))
   }
   if (!ts.running) throw new Stop(mac ? 'Tailscale is installed but not signed in. Open Tailscale, sign in, then run this again.'
     : 'Tailscale is installed but not signed in. Run sudo tailscale up, sign in, then run this again.')
@@ -663,9 +684,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   if (!ts.serveRead && !dryRun) throw new Stop('Couldn\'t read what Tailscale already shares on this computer (tailscale serve status). Check that Tailscale is running and that this account may manage it, then run this again.')
   done(`Tailscale is on (${ts.dnsName})`)
 
-  const existing = readEdgeConfig(deps)
   const edgePort = existing?.listen?.port ?? DEFAULT_EDGE_PORT
-  const port = choosePort(ts, edgePort)
+  const port = choosePort(ts, edgePort, { tailnetOnly })
+  if (!port && tailnetOnly) throw new Stop('Ports 443, 8443 and 10000 are all already shared on this computer. Free one with "tailscale serve --https=<port> off", then run this again.')
   if (!port) throw new Stop(`All of Funnel's public ports (${ts.funnelPorts.join(', ')}) are already used on this computer. Free one with "tailscale funnel --https=<port> off", then run this again.`)
   const url = publicUrl(ts.dnsName, port)
 
@@ -709,6 +730,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   const p = edgePaths(deps)
   const config = { ...(existing ?? {}), listen: { host: '127.0.0.1', port: edgePort }, upstream: `http://${backend}`,
     owners: [...new Set([...(existing?.owners ?? []), ...(owner ? [owner] : [])])] }
+  // Kept so a run without --private or --public leaves the address as public or private as it was.
+  if (tailnetOnly) config.reach = 'private'
+  else delete config.reach
   const edgeSource = path.join(HERE, 'hermes-hq-edge.mjs')
   const current = (() => { try { return JSON.parse(deps.read(p.config)) } catch { return null } })()
   const sameScript = deps.exists(p.script) && deps.read(p.script) === deps.read(edgeSource)
@@ -758,22 +782,31 @@ export async function setup(deps, { dryRun = false } = {}) {
     done('The gatekeeper is running (only your Nous account gets in)')
   }
 
-  // 7. Funnel: the public address goes to the gatekeeper only.
-  const funnelOn = choosePort(ts, edgePort) === port && (ts.serve?.AllowFunnel ?? {})[`${ts.dnsName}:${port}`] === true
-  if (funnelOn) done(`The public address is on: ${url}`)
-  else if (dryRun) todo(`turn on the public address ${url} (Tailscale Funnel → the gatekeeper)`)
+  // 7. The address goes to the gatekeeper only: on the internet with Funnel, or only on the tailnet with Serve.
+  const pointed = servesEdge(ts, port, edgePort)
+  const kind = tailnetOnly ? 'private address' : 'public address'
+  if (pointed && funnelOn(ts, port) === !tailnetOnly) done(tailnetOnly ? `The private address is on (only your Tailscale devices reach it): ${url}` : `The public address is on: ${url}`)
+  else if (dryRun) todo(tailnetOnly ? `turn on the private address ${url} (Tailscale Serve → the gatekeeper, not on the internet)` : `turn on the public address ${url} (Tailscale Funnel → the gatekeeper)`)
   else {
-    todo(`Turning on the public address ${url}`)
-    if (!ts.funnelAllowed && !agent) say('    Tailscale may ask you to allow Funnel for this computer: open the link it shows, click Allow, and come back.')
-    // Agent mode: Tailscale waits for Funnel to be allowed on the tailnet; its link goes to the person instead.
-    const r = deps.run(cli, ['funnel', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], agent ? { timeoutMs: 30_000 } : { interactive: true, timeoutMs: 15 * 60_000 })
-    if (r.status !== 0 && agent) {
-      const allow = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
-      if (allow) throw new NextStep('person', `Allow Tailscale Funnel on your Tailscale network: open ${allow} and turn it on. It puts the computer's address on the internet, where only its gatekeeper answers, and the gatekeeper lets in only your Nous account.`)
-      throw new Stop('Tailscale didn\'t turn on the public address: ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')))
+    // Switching between the two: the old one comes off first, so Tailscale never mixes them on one port.
+    if (pointed) deps.run(cli, [tailnetOnly ? 'funnel' : 'serve', `--https=${port}`, 'off'], { timeoutMs: 30_000 })
+    todo(`Turning on the ${kind} ${url}`)
+    if (tailnetOnly) {
+      const r = deps.run(cli, ['serve', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], { timeoutMs: 30_000 })
+      if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the private address: ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')))
+      done(`The private address is on (only your Tailscale devices reach it): ${url}`)
+    } else {
+      if (!ts.funnelAllowed && !agent) say('    Tailscale may ask you to allow Funnel for this computer: open the link it shows, click Allow, and come back.')
+      // Agent mode: Tailscale waits for Funnel to be allowed on the tailnet; its link goes to the person instead.
+      const r = deps.run(cli, ['funnel', '--bg', `--https=${port}`, `http://127.0.0.1:${edgePort}`], agent ? { timeoutMs: 30_000 } : { interactive: true, timeoutMs: 15 * 60_000 })
+      if (r.status !== 0 && agent) {
+        const allow = /https:\/\/login\.tailscale\.com\/\S+/.exec(r.stdout + r.stderr)?.[0]
+        if (allow) throw new NextStep('person', `Allow Tailscale Funnel on your Tailscale network: open ${allow} and turn it on. It puts the computer's address on the internet, where only its gatekeeper answers, and the gatekeeper lets in only your Nous account. (Rather keep it off the internet? If your phone already uses Tailscale, the setup can run with --private instead.)`)
+        throw new Stop('Tailscale didn\'t turn on the public address: ' + relayable((r.stdout + r.stderr).trim().split('\n').slice(-3).join(' / ')))
+      }
+      if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the public address (see above). Fix that, then run this again.')
+      done(`The public address is on: ${url}`)
     }
-    if (r.status !== 0) throw new Stop('Tailscale didn\'t turn on the public address (see above). Fix that, then run this again.')
-    done(`The public address is on: ${url}`)
   }
 
   if (dryRun) { say('\nNothing was changed (dry run).'); return { url, dryRun: true } }
@@ -781,8 +814,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   // 8. The phone. An agent passes the address on: a QR code in a chat message is no use.
   if (agent) {
     say(`\nDONE. Hermes HQ can reach this computer at: ${url}`)
-    say(`Send the person this address and tell them: in Hermes HQ, paste it into Address, then tap Sign in with Nous with the Nous account this computer's Hermes uses. Keep this computer on${mac ? ' and awake' : ''}.`)
-    return { url, owner: Boolean(owner) }
+    say(`Send the person this address and tell them: in Hermes HQ, paste it into Address, then tap Sign in with Nous with the Nous account this computer's Hermes uses. Keep this computer on${mac ? ' and awake' : ''}.`
+      + (tailnetOnly ? ' The address works only on their Tailscale network: Tailscale must be connected on their phone, signed in to the same account.' : ''))
+    return { url, owner: Boolean(owner), private: tailnetOnly }
   }
   say('\nDone! Now connect your iPhone:')
   say('  1. Open the Camera on your iPhone and point it at this code.')
@@ -790,8 +824,9 @@ export async function setup(deps, { dryRun = false } = {}) {
   say(qrTerminal(connectLink(url)))
   say(`\nCan't scan it? In Hermes HQ, tap "I already have an address" (or Add Gateway) and type: ${url}`)
   say(mac ? 'Keep this Mac on and awake: your iPhone can reach Hermes only while it is.' : 'Keep this computer on: your iPhone can reach Hermes only while it is.')
+  if (tailnetOnly) say('The address is only on your Tailscale network: leave Tailscale connected on your iPhone, signed in to the same account.')
   say('To turn it off later: curl -fsSL https://raw.githubusercontent.com/mrcharlesiv/hermes-hq/main/connect.sh | sh -s -- off')
-  return { url, owner: Boolean(owner) }
+  return { url, owner: Boolean(owner), private: tailnetOnly }
 }
 
 export async function status(deps) {
@@ -800,14 +835,17 @@ export async function status(deps) {
   const cfg = readEdgeConfig(deps)
   const cli = findTailscale(deps)
   const ts = cli ? tailscaleState(deps, cli) : null
-  const port = ts && cfg ? choosePort(ts, cfg.listen?.port ?? DEFAULT_EDGE_PORT) : null
+  const edgePort = cfg?.listen?.port ?? DEFAULT_EDGE_PORT
+  const port = ts && cfg ? choosePort(ts, edgePort, { tailnetOnly: true }) : null
   const loaded = jobs.loaded('edge') || Boolean(oldInstall(deps)?.loaded)
-  const funnel = ts && port && (ts.serve?.AllowFunnel ?? {})[`${ts.dnsName}:${port}`] === true
+  const on = Boolean(ts && port && servesEdge(ts, port, edgePort))
+  const funnel = on && funnelOn(ts, port)
   say(`Gatekeeper: ${loaded ? 'running' : 'off'}${cfg ? ` (${cfg.owners?.length ?? 0} allowed Nous account${cfg.owners?.length === 1 ? '' : 's'})` : ''}`)
-  say(`Public address: ${funnel ? publicUrl(ts.dnsName, port) : 'off'}`)
+  if (on && !funnel) say(`Private address (only your Tailscale devices): ${publicUrl(ts.dnsName, port)}`)
+  else say(`Public address: ${funnel ? publicUrl(ts.dnsName, port) : 'off'}`)
   const background = deps.exists(jobs.file('hermes')) && jobs.loaded('hermes')
   if (background) say('Hermes: running in the background (started by this setup)')
-  return { gatekeeper: loaded, url: funnel ? publicUrl(ts.dnsName, port) : null, background }
+  return { gatekeeper: loaded, url: on ? publicUrl(ts.dnsName, port) : null, private: on && !funnel, background }
 }
 
 export async function off(deps) {
@@ -817,8 +855,10 @@ export async function off(deps) {
   const cli = findTailscale(deps)
   if (cli && cfg) {
     const ts = tailscaleState(deps, cli)
-    const port = choosePort(ts, cfg.listen?.port ?? DEFAULT_EDGE_PORT)
-    if (port && (ts.serve?.AllowFunnel ?? {})[`${ts.dnsName}:${port}`]) { deps.run(cli, ['funnel', `--https=${port}`, 'off']); say(`  ✓ Public address ${publicUrl(ts.dnsName, port)} is off`) }
+    const edgePort = cfg.listen?.port ?? DEFAULT_EDGE_PORT
+    const port = choosePort(ts, edgePort, { tailnetOnly: true })
+    if (port && funnelOn(ts, port)) { deps.run(cli, ['funnel', `--https=${port}`, 'off']); say(`  ✓ Public address ${publicUrl(ts.dnsName, port)} is off`) }
+    else if (port && servesEdge(ts, port, edgePort)) { deps.run(cli, ['serve', `--https=${port}`, 'off']); say(`  ✓ Private address ${publicUrl(ts.dnsName, port)} is off`) }
   }
   if (jobs.loaded('edge') || deps.exists(jobs.file('edge'))) { jobs.remove('edge'); say('  ✓ Gatekeeper stopped') }
   if (oldInstall(deps)?.loaded) { deps.run('/bin/launchctl', ['bootout', `gui/${deps.uid}/${OLD_EDGE_LABEL}`]); say('  ✓ Gatekeeper stopped') }
@@ -840,8 +880,10 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const command = args.find((a) => !a.startsWith('-')) ?? 'setup'
   const deps = systemDeps()
   // An unknown flag (--help, a typo) prints usage instead of running setup.
-  const work = args.some((a) => a.startsWith('-') && !['--dry-run', '--agent'].includes(a)) ? null : command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run') }) : null
-  if (!work) { console.error('usage: node hermes-hq-connect.mjs [setup|status|off] [--dry-run] [--agent]'); process.exit(64) }
+  const reach = args.includes('--private') ? 'private' : args.includes('--public') ? 'public' : undefined
+  const both = args.includes('--private') && args.includes('--public')
+  const work = both || args.some((a) => a.startsWith('-') && !['--dry-run', '--agent', '--private', '--public'].includes(a)) ? null : command === 'status' ? status(deps) : command === 'off' ? off(deps) : command === 'setup' ? setup(deps, { dryRun: args.includes('--dry-run'), reach }) : null
+  if (!work) { console.error('usage: node hermes-hq-connect.mjs [setup|status|off] [--dry-run] [--agent] [--private|--public]'); process.exit(64) }
   work.catch((error) => {
     if (error instanceof NextStep) { console.log('\n' + nextStepText(error)); process.exit(error.code) }
     if (error instanceof Stop) { console.error('\n' + error.message); process.exit(error.code) }
