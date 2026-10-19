@@ -51,6 +51,9 @@ laptop: **Settings (the gear) › Plugins › Manage plugins › Install from Gi
 `https://github.com/mrcharlesiv/hermes-hq/tree/main/desktop-plugin/hermes-hq-theme`, and install. Then pick **Hermes
 HQ** in Settings › Appearance › Theme.
 
+The themes keep themselves up to date: each time the desktop app starts, they check here for a newer look
+(`desktop-plugin/hermes-hq-theme/latest.json`) and switch to it. Offline, they keep the last look they got.
+
 You can run the same command again at any time. If everything is already set up, it changes nothing. Keep the
 computer on (and a Mac awake): your iPhone can reach Hermes only while it is.
 
