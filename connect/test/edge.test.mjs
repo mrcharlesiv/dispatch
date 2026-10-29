@@ -25,7 +25,9 @@ const CODES = { // native code -> issued session
 function fakeHermes({ gated = true } = {}) {
   const seen = []
   const tickets = new Set()
-  const state = { gated, streamClosed: false }
+  // healthHangs / statusHangs: that route never answers (a Hermes busy with its gateway). oldHealth: /api/health
+  // without auth_required (a Hermes from before it said so); 401 answers it only for a signed-in caller.
+  const state = { gated, streamClosed: false, healthHangs: false, statusHangs: false, oldHealth: false }
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x')
     let body = ''
@@ -37,8 +39,13 @@ function fakeHermes({ gated = true } = {}) {
       const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
       const me = bearer && TOKENS[bearer]
       switch (url.pathname) {
-        case '/api/health': return json(200, { ok: true })
-        case '/api/status': return json(200, { auth_required: state.gated, auth_providers: ['basic', 'nous'], auth_flows: ['cookie', 'native_pkce'] })
+        case '/api/health':
+          if (state.healthHangs) return
+          if (state.oldHealth === 401) return json(401, { detail: 'Unauthorized' })
+          return json(200, state.oldHealth ? { ok: true } : { ok: true, version: '0.22.5', auth_required: state.gated })
+        case '/api/status':
+          if (state.statusHangs) return
+          return json(200, { auth_required: state.gated, auth_providers: ['basic', 'nous'], auth_flows: ['cookie', 'native_pkce'] })
         case '/api/stream': {
           // A long answer that keeps going until somebody hangs up.
           if (!me) return json(401, { error: 'unauthenticated' })
@@ -90,11 +97,13 @@ function fakeHermes({ gated = true } = {}) {
   return { server, seen, tickets, state }
 }
 
-async function setup(t, { owners = [OWNER], gated = true, now } = {}) {
+async function setup(t, { owners = [OWNER], gated = true, now, gateProbeMs, before } = {}) {
   const hermes = fakeHermes({ gated })
+  before?.(hermes.state)
   await new Promise((r) => hermes.server.listen(0, '127.0.0.1', r))
   const logs = []
-  const edge = createEdge({ upstream: `http://127.0.0.1:${hermes.server.address().port}`, owners }, { log: (e) => logs.push(e), ...(now ? { now } : {}) })
+  const edge = createEdge({ upstream: `http://127.0.0.1:${hermes.server.address().port}`, owners },
+    { log: (e) => logs.push(e), ...(now ? { now } : {}), ...(gateProbeMs ? { gateProbeMs } : {}) })
   await new Promise((r) => edge.listen(0, '127.0.0.1', r))
   // Upgraded sockets are no longer the servers' to close: track every connection and end them all.
   const open = new Set()
@@ -120,7 +129,7 @@ test('public probes pass without credentials; nothing else does', async (t) => {
     const res = await fetchEdge(path)
     assert.equal(res.status, 401, path)
   }
-  // None of the refused requests reached Hermes (/api/status is also the edge's own gate check).
+  // None of the refused requests reached Hermes (/api/health is also the edge's own gate check).
   assert.deepEqual([...new Set(hermes.seen.map((r) => r.path))].sort(), ['/api/health', '/api/status'])
 })
 
@@ -434,11 +443,17 @@ async function resettingHermes(t, paths) {
   const server = http.createServer((req, res) => {
     const path = new URL(req.url, 'http://x').pathname
     req.socket.served = (req.socket.served ?? 0) + 1
-    seen.push({ path, reused: req.socket.served > 1 })
-    if (paths.includes(path) && req.socket.served > 1 && !spent.has(path)) { spent.add(path); return req.socket.destroy() }
-    const body = path === '/api/status' ? { auth_required: true, auth_providers: ['nous'], auth_flows: ['native_pkce'] } : { ok: true }
-    const text = JSON.stringify(body)
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) }); res.end(text)
+    let sentBody = ''
+    req.on('data', (c) => { sentBody += c })
+    req.on('end', () => {
+      seen.push({ path, reused: req.socket.served > 1, edgeCall: req.headers.accept === 'application/json', body: sentBody })
+      if (paths.includes(path) && req.socket.served > 1 && !spent.has(path)) { spent.add(path); return req.socket.destroy() }
+      const body = path === '/api/status' ? { auth_required: true, auth_providers: ['nous'], auth_flows: ['native_pkce'] }
+        : path === '/api/auth/me' ? TOKENS['owner-at']
+        : path === '/api/auth/ws-ticket' ? { ticket: 'fresh', ttl_seconds: 30 } : { ok: true }
+      const text = JSON.stringify(body)
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) }); res.end(text)
+    })
   })
   await new Promise((r) => server.listen(0, '127.0.0.1', r))
   const logs = []
@@ -454,7 +469,7 @@ test('a read that meets a connection Hermes just closed is sent once more on a f
   assert.equal((await raw(base, '/api/health')).status, 200)
   const second = await raw(base, '/api/health')
   assert.equal(second.status, 200, 'the phone never sees the reset')
-  const health = seen.filter((r) => r.path === '/api/health')
+  const health = seen.filter((r) => r.path === '/api/health' && !r.edgeCall) // not the edge's own gate checks
   assert.equal(health.length, 3, 'one answered, one reset, one sent again')
   assert.ok(!logs.some((e) => e.decision === 'upstream-error'))
 })
@@ -535,3 +550,87 @@ test('every 429 and 503 says when to try again (N1)', async (t) => {
   })
   assert.deepEqual(upgrade, { status: 503, retry: '5' })
 })
+
+// 2026-10-28 owner: "it takes too long to connect to the gateway when i open the app sometimes". The edge asked the
+// heavy /api/status every minute; each time it missed 15 s (Hermes busy with its messaging gateway) the edge read the
+// gate as off and refused every phone request until a later check got through: 17:41-17:57 one day, 07:31-07:56 another.
+test('the gate is read from /api/health; a slow /api/status refuses nothing', async (t) => {
+  const { fetchEdge, hermes, logs } = await setup(t, { before: (state) => { state.statusHangs = true } })
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  assert.equal((await fetchEdge('/api/auth/ws-ticket', { method: 'POST', ...bearer('owner-at'), body: '{}' })).status, 200)
+  assert.ok(!hermes.seen.some((r) => r.path === '/api/status'), 'the gate check never waits on /api/status')
+  assert.ok(!logs.some((e) => e.decision === 'upstream-gate-off'))
+})
+
+test('a gate check that gets no answer keeps a gate seen on; Hermes saying it is off turns it off at once', async (t) => {
+  const { fetchEdge, edge, hermes, logs } = await setup(t, { gateProbeMs: 100 })
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200) // gate seen on
+  hermes.state.healthHangs = true
+  assert.equal(await edge.checkGate(), true, 'a busy Hermes is the same process that said its gate was on')
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  const missed = logs.find((e) => e.decision === 'gate-check-missed')
+  assert.deepEqual([missed?.code, missed?.kept], ['ETIMEDOUT', true])
+  hermes.state.healthHangs = false
+  hermes.state.gated = false
+  assert.equal(await edge.checkGate(), false)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 503)
+})
+
+test('a gate never seen on stays shut while Hermes gives no answer', async (t) => {
+  const { fetchEdge } = await setup(t, { gateProbeMs: 100, before: (state) => { state.healthHangs = true } })
+  const refused = await fetchEdge('/api/sessions', bearer('owner-at'))
+  assert.equal(refused.status, 503)
+  assert.deepEqual(await refused.json(), { error: 'gateway_auth_gate_off' })
+})
+
+test('a Hermes that refused connections (restarting) is asked about its gate again before anything is forwarded', async (t) => {
+  const { fetchEdge, hermes } = await setup(t)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  const port = hermes.server.address().port
+  await new Promise((r) => { hermes.server.close(r); hermes.server.closeAllConnections?.() })
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 503) // down
+  // It comes back on the same port with its gate off (bound to loopback): nothing is served.
+  hermes.state.gated = false
+  await new Promise((r) => hermes.server.listen(port, '127.0.0.1', r))
+  const before = hermes.seen.filter((r) => r.path === '/api/sessions').length
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 503)
+  assert.equal(hermes.seen.filter((r) => r.path === '/api/sessions').length, before, 'never forwarded')
+})
+
+test('requests that arrive while the gate is being checked share that one check', async (t) => {
+  const { fetchEdge, edge, hermes } = await setup(t)
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200)
+  const port = hermes.server.address().port
+  await new Promise((r) => { hermes.server.close(r); hermes.server.closeAllConnections?.() })
+  assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 503) // the refusal forgets the gate
+  await new Promise((r) => hermes.server.listen(port, '127.0.0.1', r))
+  const checks = () => hermes.seen.filter((r) => r.path === '/api/health').length
+  const before = checks()
+  const answers = await Promise.all(Array.from({ length: 6 }, () => fetchEdge('/api/sessions', bearer('owner-at'))))
+  assert.deepEqual(answers.map((a) => a.status), [200, 200, 200, 200, 200, 200])
+  assert.equal(checks() - before, 1)
+  assert.equal(typeof edge.checkGate, 'function')
+})
+
+test('a Hermes whose /api/health predates auth_required (or wants a sign-in) is read from /api/status, as before', async (t) => {
+  for (const oldHealth of [true, 401]) {
+    const { fetchEdge, edge, hermes } = await setup(t, { before: (state) => { state.oldHealth = oldHealth } })
+    assert.equal((await fetchEdge('/api/sessions', bearer('owner-at'))).status, 200, `health ${oldHealth}`)
+    hermes.state.gated = false
+    assert.equal(await edge.checkGate(), false)
+  }
+})
+
+test('a socket ticket that meets a connection Hermes just closed is minted on a fresh one, body and all', async (t) => {
+  const { seen, logs, base } = await resettingHermes(t, ['/api/auth/ws-ticket'])
+  const mint = () => fetch(base + '/api/auth/ws-ticket', { method: 'POST', headers: { authorization: 'Bearer owner-at', 'content-type': 'application/json' }, body: '{}' })
+  assert.equal((await mint()).status, 200)
+  const second = await mint()
+  assert.equal(second.status, 200, 'the phone never sees the reset')
+  assert.deepEqual(await second.json(), { ticket: 'fresh', ttl_seconds: 30 })
+  const tickets = seen.filter((r) => r.path === '/api/auth/ws-ticket')
+  assert.equal(tickets.length, 3, 'one answered, one reset, one sent again')
+  assert.ok(tickets.every((r) => r.body === '{}'))
+  assert.ok(!logs.some((e) => e.decision === 'upstream-down' || e.decision === 'upstream-error'))
+})
+

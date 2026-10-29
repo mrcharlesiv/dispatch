@@ -58,7 +58,20 @@ const COMPRESS_MIN_BYTES = 1024
 // window, and sends a bodyless read again once when it still meets that reset (Node's documented reusedSocket case).
 const UPSTREAM_IDLE_MS = 2000
 const RETRY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+// POSTs that may go out twice: a socket ticket nobody uses expires on its own in 30 s. Their small body is held so it
+// can be sent again on a fresh connection (the ticket was a fifth of the edge's resets, each a failed phone connect).
+const RESENDABLE_POSTS = new Set(['/api/auth/ws-ticket'])
+const RESENDABLE_MAX_BODY = 4 * 1024
 const staleConnection = (error, request) => request.reusedSocket === true && (error?.code === 'ECONNRESET' || error?.code === 'EPIPE')
+// The gate check asks /api/health, which states auth_required in milliseconds. It used to ask /api/status, which also
+// gathers the gateway's health, platforms and storage: seconds as a rule, 15 and more while the messaging gateway was
+// busy. Every miss of the 15 s read as "gate off" and refused every phone request until a later check got through
+// (2026-10-28 17:41-17:57; 2026-10-27 07:31-07:56; dozens of shorter ones a day: "it takes too long to connect").
+// A check that gets no answer from a Hermes still holding its port is not an answer: the process that said its gate
+// was on is still the one answering. Only Hermes saying otherwise turns the gate off, or Hermes going away (its port
+// refusing connections: a restart, which can change its bind), after which the next request asks again first.
+const GATE_PROBE_MS = 5_000
+const GONE_CODES = new Set(['ECONNREFUSED', 'ENOTCONN'])
 // While Hermes is down (restarting: nothing listens on its port) the edge says so with 503 and when to try again,
 // so clients back off instead of hammering a dead port (and a 502 isn't read as a broken edge).
 const RETRY_AFTER_DOWN_S = 5
@@ -128,7 +141,7 @@ export function expiredJwt(token, nowMs = Date.now()) {
   } catch { return false }
 }
 
-export function createEdge(config, { log = defaultLog, now = () => Date.now() } = {}) {
+export function createEdge(config, { log = defaultLog, now = () => Date.now(), gateProbeMs = GATE_PROBE_MS } = {}) {
   const cfg = config.upstream instanceof URL ? config : normalizeConfig(config)
   const upstreamHost = cfg.upstream.host // Hermes refuses any Host but its bound or declared public one.
   const client = http
@@ -136,17 +149,36 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   const verified = new Map() // sha256(bearer) -> {userId, until}
   const authorizeLimit = limiter(10 * 60_000, cfg.authorizePerIpPer10Min, now)
   // Defence in depth: Hermes's own gate must stay on (a non-loopback bind). A Hermes bound to 127.0.0.1 checks
-  // nothing, so the edge would be the only lock: it serves nothing until /api/status says auth_required again.
-  let gated = null // null: not yet known
-  async function checkGate() {
+  // nothing, so the edge would be the only lock: it serves nothing until Hermes says auth_required again.
+  let gated = null // null: not yet known (or Hermes went away since it was)
+  let gateCheck = null // the check in flight: requests that arrive meanwhile wait on it instead of asking again
+  /** {on} when Hermes said whether its gate is on; {missed, gone} when it didn't answer. */
+  async function askGate() {
+    const health = await call('GET', '/api/health', { timeoutMs: gateProbeMs })
+    let body = null
+    try { body = JSON.parse(health.body.toString('utf8')) } catch {}
+    if (health.status === 200 && typeof body?.auth_required === 'boolean') return { on: body.auth_required, status: 200 }
+    if (health.code) return { missed: true, gone: GONE_CODES.has(health.code), status: health.status, code: health.code }
+    // A Hermes from before /api/health said auth_required (or answered it only signed in): its full status, as before.
     const answer = await call('GET', '/api/status')
     let status = null
     try { status = JSON.parse(answer.body.toString('utf8')) } catch {}
-    const next = answer.status === 200 && status?.auth_required === true
-    if (next !== gated) log({ t: new Date(now()).toISOString(), decision: next ? 'upstream-gated' : 'upstream-gate-off', status: answer.status })
-    gated = next
-    return gated
+    if (answer.status === 200 && status && typeof status === 'object') return { on: status.auth_required === true, status: 200 }
+    return { missed: true, gone: GONE_CODES.has(answer.code), status: answer.status, code: answer.code }
   }
+  function checkGate() {
+    gateCheck ??= askGate().then((seen) => {
+      const next = seen.missed ? (seen.gone ? null : gated) : seen.on
+      // A busy Hermes (the case worth seeing later); a gone one already logs each refused request.
+      if (seen.missed && !seen.gone) log({ t: new Date(now()).toISOString(), decision: 'gate-check-missed', status: seen.status, ...(seen.code ? { code: seen.code } : {}), kept: next === true })
+      if ((next === true) !== (gated === true)) log({ t: new Date(now()).toISOString(), decision: next === true ? 'upstream-gated' : 'upstream-gate-off', status: seen.status })
+      gated = next
+      return gated === true
+    }).finally(() => { gateCheck = null })
+    return gateCheck
+  }
+  /** Hermes refused a connection: it is restarting, and may come back with another bind. Ask before the next request. */
+  function upstreamGone(code) { if (GONE_CODES.has(code)) gated = null }
   // Bad credentials (a wrong or stranger's bearer, a blocked route): guards Hermes against guessing.
   const failureLimit = limiter(60_000, cfg.failuresPerIpPerMin, now)
   // No credentials at all: its own bucket, which never gates a request that carries a bearer.
@@ -222,7 +254,20 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
 
   /** Streams the request to Hermes and its answer back (no cookies either way unless `keepCookie` allows). The
    *  upstream request ends with the client's: a phone that went away doesn't leave Hermes streaming to nobody. */
-  function proxy(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision, compress = false }) {
+  function proxy(req, res, options) {
+    if (req.method !== 'POST' || !RESENDABLE_POSTS.has(pathOf(req.url))) return forward(req, res, options)
+    const chunks = []
+    let size = 0
+    req.on('data', (c) => { size += c.length; if (size <= RESENDABLE_MAX_BODY) chunks.push(c) })
+    req.on('end', () => {
+      if (size > RESENDABLE_MAX_BODY) { record(req, 413, 'body-too-large'); return send(res, 413, { error: 'body_too_large' }) }
+      forward(req, res, { ...options, held: Buffer.concat(chunks) })
+    })
+    req.on('error', () => res.destroy())
+  }
+
+  /** `held`: the whole body, already read, so the request can go out again after a stale connection's reset. */
+  function forward(req, res, { path = req.url, bearer = null, cookies = null, keepCookie, decision, compress = false, held = null }) {
     let answered = false
     let upstreamReq
     const ask = (retried) => {
@@ -249,18 +294,20 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
       sent.on('error', (error) => {
         if (res.writableEnded || sent !== upstreamReq) return
         if (answered) { clearTimeout(waiting); return res.destroy() }
-        if (!retried && RETRY_METHODS.has(req.method) && staleConnection(error, sent)) return ask(true)
+        if (!retried && (RETRY_METHODS.has(req.method) || held) && staleConnection(error, sent)) return ask(true)
         clearTimeout(waiting)
         // The system error code only (ECONNREFUSED, ECONNRESET…): never a message, which could quote an address.
         const code = typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown'
+        upstreamGone(code)
         if (DOWN_CODES.has(code) && !answered) {
           send(res, 503, { error: 'gateway_unavailable' }, { 'retry-after': String(RETRY_AFTER_DOWN_S) })
           return record(req, 503, 'upstream-down', { code, reused: sent.reusedSocket === true, retried })
         }
         send(res, 502, { error: 'upstream_unreachable' }); record(req, 502, 'upstream-error', { code, reused: sent.reusedSocket === true, retried })
       })
-      // A read has no body to send (and so can be sent again); anything else streams the client's body through.
-      if (RETRY_METHODS.has(req.method)) sent.end(); else req.pipe(sent)
+      // A read has no body to send and a held body is sent whole (both can be sent again); anything else streams the
+      // client's body through.
+      if (held) sent.end(held); else if (RETRY_METHODS.has(req.method)) sent.end(); else req.pipe(sent)
     }
     const read = RETRY_METHODS.has(req.method) && !/text\/event-stream/i.test(String(req.headers.accept ?? ''))
     const waiting = setTimeout(() => {
@@ -273,8 +320,9 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
   }
 
 
-  /** One buffered call to Hermes (auth checks and the token routes). */
-  function call(method, path, { headers = {}, body = null } = {}, retried = false) {
+  /** One buffered call to Hermes (auth checks and the token routes). No answer comes back as 502 with the system
+   *  error `code` (ETIMEDOUT for `timeoutMs`). */
+  function call(method, path, { headers = {}, body = null, timeoutMs = 15_000 } = {}, retried = false) {
     return new Promise((resolve) => {
       const upstreamReq = client.request({ protocol: cfg.upstream.protocol, hostname: cfg.upstream.hostname, port: cfg.upstream.port, agent,
         method, path, headers: { host: upstreamHost, accept: 'application/json', ...headers, ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}) } }, (upstreamRes) => {
@@ -283,11 +331,13 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now() } 
         upstreamRes.on('end', () => resolve({ status: upstreamRes.statusCode ?? 502, headers: upstreamRes.headers, body: Buffer.concat(chunks) }))
         upstreamRes.on('error', () => resolve({ status: 502, headers: {}, body: Buffer.alloc(0) }))
       })
-      upstreamReq.setTimeout(15_000, () => upstreamReq.destroy())
+      let timedOut = false
+      upstreamReq.setTimeout(timeoutMs, () => { timedOut = true; upstreamReq.destroy() })
       upstreamReq.on('error', (error) => {
         // Nothing was answered on a connection Hermes had just closed: the same call once more on a fresh one.
-        if (!retried && staleConnection(error, upstreamReq)) return resolve(call(method, path, { headers, body }, true))
-        resolve({ status: 502, headers: {}, body: Buffer.alloc(0) })
+        if (!retried && !timedOut && staleConnection(error, upstreamReq)) return resolve(call(method, path, { headers, body, timeoutMs }, true))
+        const code = timedOut ? 'ETIMEDOUT' : (typeof error?.code === 'string' && /^[A-Z_]{3,32}$/.test(error.code) ? error.code : 'unknown')
+        resolve({ status: 502, headers: {}, body: Buffer.alloc(0), code })
       })
       if (body) upstreamReq.write(body)
       upstreamReq.end()
