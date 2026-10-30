@@ -64,6 +64,9 @@ function fakeHermes({ gated = true } = {}) {
         }
         case '/auth/native/refresh': {
           const parsed = JSON.parse(body || '{}')
+          // A test's own answer for one refresh token (a slow rotation, a reuse Portal refuses).
+          const planned = state.refresh?.[parsed.refresh_token]
+          if (planned) return planned(json, req, res)
           if (parsed.refresh_token === 'owner-rt-1') return json(200, { ...CODES['owner-code'], refresh_token: 'owner-rt-2' })
           if (parsed.refresh_token === 'fleet-rt') return json(200, CODES['fleet-code'])
           return json(401, { error: 'session_expired', detail: 'Refresh token expired or invalid; start a new sign-in.' })
@@ -97,13 +100,13 @@ function fakeHermes({ gated = true } = {}) {
   return { server, seen, tickets, state }
 }
 
-async function setup(t, { owners = [OWNER], gated = true, now, gateProbeMs, before } = {}) {
+async function setup(t, { owners = [OWNER], gated = true, now, gateProbeMs, before, edgeOptions = {} } = {}) {
   const hermes = fakeHermes({ gated })
   before?.(hermes.state)
   await new Promise((r) => hermes.server.listen(0, '127.0.0.1', r))
   const logs = []
   const edge = createEdge({ upstream: `http://127.0.0.1:${hermes.server.address().port}`, owners },
-    { log: (e) => logs.push(e), ...(now ? { now } : {}), ...(gateProbeMs ? { gateProbeMs } : {}) })
+    { log: (e) => logs.push(e), ...(now ? { now } : {}), ...(gateProbeMs ? { gateProbeMs } : {}), ...edgeOptions })
   await new Promise((r) => edge.listen(0, '127.0.0.1', r))
   // Upgraded sockets are no longer the servers' to close: track every connection and end them all.
   const open = new Set()
@@ -634,3 +637,80 @@ test('a socket ticket that meets a connection Hermes just closed is minted on a 
   assert.ok(!logs.some((e) => e.decision === 'upstream-down' || e.decision === 'upstream-error'))
 })
 
+
+// 2026-10-30 19:45-19:52: a slow Hermes answered the desktop's refresh 503 "still in flight", rotated the token behind
+// it, and kept that rotation for 5 minutes; the desktop's next try came after them with the old token, Portal refused
+// the reuse, and the desktop was signed out. The edge now settles the refresh itself and keeps what Hermes rotated.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const FAST_REFRESH = { refreshWaitMs: 300, refreshRetryMaxMs: 50, refreshSettleMs: 5_000 }
+
+test('a refresh Hermes is still rotating is settled by the edge and handed to the old token later', async (t) => {
+  let asked = 0, firstAt = 0, rotated = 0
+  const { fetchEdge, hermes, logs } = await setup(t, { edgeOptions: FAST_REFRESH, before: (state) => {
+    state.refresh = { 'slow-rt': (json) => {
+      asked += 1; firstAt ||= Date.now()
+      // Pending for 600 ms (past the client's whole wait), then the rotation; after it Hermes has forgotten and the old
+      // token is a reuse (Portal's 401).
+      if (Date.now() - firstAt < 600) return json(503, { error: 'refresh_pending', retry_after: 1 }, { 'retry-after': '1' })
+      if (!rotated) { rotated = asked; return json(200, { ...CODES['owner-code'], access_token: 'owner-at', refresh_token: 'slow-rt-2' }) }
+      return json(401, { error: 'session_expired', detail: 'Refresh token expired or invalid; start a new sign-in.' })
+    } }
+  } })
+  const first = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'slow-rt' }))
+  assert.equal(first.status, 503)
+  assert.equal(first.headers.get('retry-after'), '1')
+  assert.equal((await first.json()).error, 'refresh_pending')
+  // The edge goes on asking with the same token until Hermes answers the rotation.
+  for (let i = 0; i < 80 && !rotated; i++) await sleep(25)
+  assert.ok(rotated > 1)
+  // Long after Hermes forgot: the old token gets the rotation, and Portal never sees the reuse.
+  await sleep(100)
+  const later = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'slow-rt' }))
+  assert.equal(later.status, 200)
+  assert.equal((await later.json()).refresh_token, 'slow-rt-2')
+  assert.equal(asked, rotated)
+  assert.equal(hermes.seen.filter((r) => r.path === '/auth/native/refresh').length, rotated)
+  assert.deepEqual(logs.filter((e) => e.path === '/auth/native/refresh').map((e) => e.decision), ['token-pending', 'token-replayed'])
+  // Delivered once: a repeat of the old token now goes to Hermes, whose Portal catches the reuse.
+  const reused = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'slow-rt' }))
+  assert.equal(reused.status, 401)
+  assert.equal(asked, rotated + 1)
+})
+
+test('a refresh answered within the wait is not held, and a dead token is still refused at once', async (t) => {
+  let asked = 0
+  const { fetchEdge } = await setup(t, { edgeOptions: FAST_REFRESH, before: (state) => {
+    state.refresh = { 'quick-rt': (json) => {
+      asked += 1
+      return asked === 1 ? json(503, { error: 'refresh_pending' }, { 'retry-after': '1' }) : json(200, { ...CODES['owner-code'], refresh_token: 'quick-rt-2' })
+    } }
+  } })
+  const ok = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'quick-rt' }))
+  assert.equal(ok.status, 200)
+  assert.equal((await ok.json()).refresh_token, 'quick-rt-2')
+  // Received at once, so nothing is kept: the next repeat is Hermes's to answer.
+  await fetchEdge('/auth/native/refresh', post({ refresh_token: 'quick-rt' }))
+  assert.equal(asked, 3)
+  const started = Date.now()
+  assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'revoked' }))).status, 401)
+  assert.ok(Date.now() - started < 250)
+})
+
+test('a refresh Hermes never answered is 503 with Retry-After, never a 502 the client reads as broken', async (t) => {
+  const { fetchEdge } = await setup(t, { edgeOptions: { ...FAST_REFRESH, refreshSettleMs: 200 }, before: (state) => {
+    state.refresh = { 'lost-rt': (json, req, res) => res.destroy() } // the connection dies before any answer
+  } })
+  const lost = await fetchEdge('/auth/native/refresh', post({ refresh_token: 'lost-rt' }))
+  assert.equal(lost.status, 503)
+  assert.equal(lost.headers.get('retry-after'), '2')
+})
+
+test("a stranger's rotation is never kept for a replay", async (t) => {
+  let asked = 0
+  const { fetchEdge } = await setup(t, { edgeOptions: FAST_REFRESH, before: (state) => {
+    state.refresh = { 'stranger-rt': (json) => { asked += 1; return json(200, CODES['stranger-code']) } }
+  } })
+  assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'stranger-rt' }))).status, 403)
+  assert.equal((await fetchEdge('/auth/native/refresh', post({ refresh_token: 'stranger-rt' }))).status, 403)
+  assert.equal(asked, 2)
+})

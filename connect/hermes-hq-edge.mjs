@@ -80,6 +80,23 @@ const DOWN_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ENOTCONN'])
 // retrying without credentials (Hermes desktop's cookie fallback during a gateway restart) never locks out the
 // valid-bearer requests from the same address.
 const RETRY_AFTER_LIMITED_S = 30
+// Portal's refresh tokens rotate (24 h, reuse detection): an old one sent again after its rotation revokes the whole
+// sign-in. Hermes rotates on a thread that outlives a slow request and hands that rotation to a repeat of the old
+// token for only 5 minutes. On 2026-10-30 a slow Hermes answered the desktop's refresh 503 at 19:45:18 (the edge passed
+// it on as a 502 with no Retry-After), finished the rotation behind it, and the desktop's next try at 19:52:57 sent the
+// old token after those 5 minutes: Portal revoked it and the desktop was signed out (twice a day on 10-29 and 10-30). So the
+// edge settles every refresh itself: it asks Hermes again with the same token until Hermes gives a final answer, holds
+// the client at most REFRESH_WAIT_MS (Hermes desktop gives up at 10 s) before telling it 503 + Retry-After, and keeps a
+// rotation no client has received yet (for at most ROTATION_KEEP_MS), handing it to the old token's next try instead of
+// letting that reach Portal. A rotation once delivered is dropped: a later repeat is Portal's reuse to catch.
+const REFRESH_WAIT_MS = 8_000
+const REFRESH_SETTLE_MS = 270_000 // inside Hermes's own 5 minutes, so a rotation Hermes finished is still there to read
+const REFRESH_RETRY_MAX_MS = 5_000
+const ROTATION_KEEP_MS = 24 * 3_600_000
+const MAX_ROTATIONS = 256
+const MAX_SETTLING = 32
+const UNSETTLED = new Set([502, 503, 504])
+const PENDING_RETRY_AFTER_S = 2
 
 export function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -141,8 +158,11 @@ export function expiredJwt(token, nowMs = Date.now()) {
   } catch { return false }
 }
 
-export function createEdge(config, { log = defaultLog, now = () => Date.now(), gateProbeMs = GATE_PROBE_MS } = {}) {
+export function createEdge(config, { log = defaultLog, now = () => Date.now(), gateProbeMs = GATE_PROBE_MS,
+  refreshWaitMs = REFRESH_WAIT_MS, refreshSettleMs = REFRESH_SETTLE_MS, refreshRetryMaxMs = REFRESH_RETRY_MAX_MS } = {}) {
   const cfg = config.upstream instanceof URL ? config : normalizeConfig(config)
+  const rotations = new Map() // sha256(old refresh token) -> {until, answer}: an owner's rotation not yet delivered
+  const settling = new Map() // sha256(old refresh token) -> {done, last}: the refresh being settled, Hermes's latest answer
   const upstreamHost = cfg.upstream.host // Hermes refuses any Host but its bound or declared public one.
   const client = http
   const agent = new http.Agent({ keepAlive: true, timeout: UPSTREAM_IDLE_MS })
@@ -377,8 +397,15 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now(), g
     let body
     try { body = JSON.parse(raw.toString('utf8') || '{}') } catch { return send(res, 400, { error: 'bad_request' }) }
     // A refresh is only ever asked of the Nous provider: never the password provider's opaque tokens.
-    if (path === '/auth/native/refresh') body.provider = cfg.provider
-    const answer = await call('POST', path, { body: JSON.stringify(body) })
+    const refresh = path === '/auth/native/refresh'
+    if (refresh) body.provider = cfg.provider
+    const answer = refresh ? await refreshAnswer(body) : await call('POST', path, { body: JSON.stringify(body) })
+    if (refresh && UNSETTLED.has(answer.status)) {
+      // Not settled yet (Hermes still rotating, or out of reach): the client keeps its refresh token and asks again.
+      record(req, 503, 'token-pending', answer.code ? { code: answer.code } : {})
+      return send(res, 503, { error: 'refresh_pending', detail: 'Sign-in renewal is still in progress; retry with the same refresh token.' },
+        { 'retry-after': String(retryAfterOf(answer)) })
+    }
     if (answer.status !== 200) {
       record(req, answer.status, 'token-refused')
       return send(res, answer.status, safeError(answer))
@@ -396,8 +423,52 @@ export function createEdge(config, { log = defaultLog, now = () => Date.now(), g
     if (typeof payload.access_token === 'string' && payload.access_token && Number.isFinite(expiresAt) && expiresAt > now()) {
       verified.set(sha(payload.access_token), { userId: String(payload.user_id), until: Math.min(now() + AUTH_CACHE_MS, expiresAt) })
     }
-    record(req, 200, 'token-issued', { user_id: String(payload.user_id) })
+    record(req, 200, answer.replayed ? 'token-replayed' : 'token-issued', { user_id: String(payload.user_id) })
+    // Delivered: from here a repeat of the old token is Portal's to judge (reuse detection), after Hermes's 5 minutes.
+    if (refresh) res.on('finish', () => rotations.delete(answer.key))
     send(res, 200, payload)
+  }
+
+  /** Hermes's final answer to refreshing `body.refresh_token`, or an unsettled one (503) after `refreshWaitMs` while
+   *  the edge keeps asking on its own. A rotation no client has received yet is handed to the old token's next try. */
+  async function refreshAnswer(body) {
+    const key = sha(String(body.refresh_token ?? ''))
+    const kept = rotations.get(key)
+    if (kept && kept.until > now()) return { ...kept.answer, key, replayed: true }
+    rotations.delete(key)
+    let settle = settling.get(key)
+    if (!settle) {
+      if (settling.size >= MAX_SETTLING) return call('POST', '/auth/native/refresh', { body: JSON.stringify(body) })
+      settle = { last: null }
+      settle.done = settleRefresh(key, JSON.stringify(body), settle).finally(() => settling.delete(key))
+      settling.set(key, settle)
+    }
+    let timer
+    const waited = new Promise((resolve) => { timer = setTimeout(resolve, refreshWaitMs, null); timer.unref?.() })
+    const answer = await Promise.race([settle.done, waited])
+    clearTimeout(timer)
+    return { ...(answer ?? settle.last ?? { status: 503, headers: {}, body: Buffer.alloc(0) }), key }
+  }
+
+  async function settleRefresh(key, text, settle) {
+    const started = performance.now()
+    for (;;) {
+      const answer = settle.last = await call('POST', '/auth/native/refresh', { body: text })
+      if (answer.status === 200) {
+        let payload = null
+        try { payload = JSON.parse(answer.body.toString('utf8')) } catch {}
+        if (payload?.provider === cfg.provider && cfg.owners.has(String(payload.user_id))) {
+          rotations.set(key, { until: now() + ROTATION_KEEP_MS, answer })
+          if (rotations.size > MAX_ROTATIONS) {
+            for (const [k, v] of rotations) if (v.until <= now()) rotations.delete(k)
+            while (rotations.size > MAX_ROTATIONS) rotations.delete(rotations.keys().next().value)
+          }
+        }
+        return answer
+      }
+      if (!UNSETTLED.has(answer.status) || performance.now() - started >= refreshSettleMs) return answer
+      await new Promise((resolve) => setTimeout(resolve, Math.min(retryAfterOf(answer) * 1000, refreshRetryMaxMs)).unref?.())
+    }
   }
 
   /** Hermes's public status, saying what this door offers: only Nous native sign-in. Hermes HQ's sign-in form reads it
@@ -549,6 +620,12 @@ export function shouldCompress(req, upstreamRes) {
 function pathOf(raw) { try { return new URL(raw, 'http://edge.invalid').pathname } catch { return '?' } }
 
 /** A refused token answer, reduced to Hermes's error code; never echoes the request. */
+/** Whole seconds an unsettled refresh answer says to wait (Hermes's Retry-After, 1–30), else PENDING_RETRY_AFTER_S. */
+function retryAfterOf(answer) {
+  const seconds = Number(answer.headers?.['retry-after'])
+  return Number.isFinite(seconds) && seconds >= 1 ? Math.min(30, Math.ceil(seconds)) : PENDING_RETRY_AFTER_S
+}
+
 function safeError(answer) {
   try {
     const body = JSON.parse(answer.body.toString('utf8'))
